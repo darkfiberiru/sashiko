@@ -21,6 +21,7 @@ use crate::{
 use anyhow::{Context, Result, anyhow};
 use futures::stream::StreamExt;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     io::Write,
@@ -44,6 +45,9 @@ pub struct WorkerOptions {
     pub stages: Option<Vec<u8>>,
     pub scratch_clone: bool,
     pub current_tree: bool,
+    /// Root directory for stage checkpoints. Overrides the configured
+    /// `review.checkpoint_dir` when set.
+    pub checkpoint_dir: Option<PathBuf>,
 }
 
 impl Default for WorkerOptions {
@@ -63,6 +67,7 @@ impl Default for WorkerOptions {
             stages: None,
             scratch_clone: false,
             current_tree: false,
+            checkpoint_dir: None,
         }
     }
 }
@@ -268,34 +273,55 @@ pub async fn run_git_review(
 
 pub async fn run_worker(
     input: ReviewInput,
-    options: WorkerOptions,
+    mut options: WorkerOptions,
     repo_override: Option<PathBuf>,
     progress: Option<&ProgressCallback<'_>>,
 ) -> Result<Value> {
-    let (mut ai, configured_repo_path, concurrency) = if let Some(path) = &options.settings_path {
-        let local_settings = Settings::local_review_from_file(path)
-            .with_context(|| format!("Failed to load settings from {}", path.display()))?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else if repo_override.is_some() {
-        let local_settings =
-            Settings::local_review_settings().context("Failed to load local review settings")?;
-        let concurrency = local_settings
-            .review
-            .and_then(|r| r.concurrency)
-            .unwrap_or(4);
-        (local_settings.ai, None, concurrency)
-    } else {
-        let settings = Settings::new().context("Failed to load settings")?;
-        (
-            settings.ai,
-            Some(PathBuf::from(settings.git.repository_path)),
-            settings.review.concurrency,
-        )
-    };
+    let (mut ai, configured_repo_path, concurrency, configured_checkpoint_dir) =
+        if let Some(path) = &options.settings_path {
+            let local_settings = Settings::local_review_from_file(path)
+                .with_context(|| format!("Failed to load settings from {}", path.display()))?;
+            let concurrency = local_settings
+                .review
+                .as_ref()
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            let checkpoint_dir = local_settings
+                .review
+                .as_ref()
+                .and_then(|r| r.checkpoint_dir.clone());
+            (local_settings.ai, None, concurrency, checkpoint_dir)
+        } else if repo_override.is_some() {
+            let local_settings = Settings::local_review_settings()
+                .context("Failed to load local review settings")?;
+            let concurrency = local_settings
+                .review
+                .as_ref()
+                .and_then(|r| r.concurrency)
+                .unwrap_or(4);
+            let checkpoint_dir = local_settings
+                .review
+                .as_ref()
+                .and_then(|r| r.checkpoint_dir.clone());
+            (local_settings.ai, None, concurrency, checkpoint_dir)
+        } else {
+            let settings = Settings::new().context("Failed to load settings")?;
+            (
+                settings.ai,
+                Some(PathBuf::from(settings.git.repository_path)),
+                settings.review.concurrency,
+                Some(settings.review.checkpoint_dir.clone()),
+            )
+        };
+
+    // Resolve the checkpoint root once, here, so every later use reads the same
+    // answer: an explicit --checkpoint-dir wins over configuration, and an empty
+    // configured value disables checkpointing.
+    options.checkpoint_dir = options.checkpoint_dir.clone().or_else(|| {
+        configured_checkpoint_dir
+            .filter(|dir| !dir.trim().is_empty())
+            .map(PathBuf::from)
+    });
 
     if let Some(provider) = &options.ai_provider {
         ai.provider = provider.clone();
@@ -479,6 +505,19 @@ async fn review_single_patch(
             .get(&p.index)
             .map(|sha| format!("{}..{}", baseline_sha, sha));
 
+        // Checkpoints are scoped to what is being reviewed and with what, so
+        // two reviews can never see each other's stages. The worker fingerprints
+        // each stage's inputs on top of this, so a mismatch is caught even if a
+        // scope is somehow reused.
+        let checkpoint_dir = options.checkpoint_dir.as_ref().map(|root| {
+            root.join(checkpoint_scope(
+                patch_shas.get(&p.index).map(String::as_str),
+                baseline_sha,
+                &ai.model,
+                p.index,
+            ))
+        });
+
         let mut worker = Worker::new(
             provider,
             std::sync::Arc::new(tools),
@@ -491,6 +530,7 @@ async fn review_single_patch(
                 series_range,
                 stages: options.stages.clone(),
                 stage_concurrency: ai.stage_concurrency,
+                checkpoint_dir,
             },
         );
 
@@ -1128,12 +1168,81 @@ pub fn print_worker_json(result: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Directory name identifying one patch review's checkpoints.
+///
+/// Everything that changes what a stage computes is folded in, so a different
+/// patch, baseline or model gets a different scope instead of colliding with an
+/// existing one. A patch with no sha (an mbox that was applied but not
+/// committed) falls back to its index within the series.
+fn checkpoint_scope(
+    patch_sha: Option<&str>,
+    baseline_sha: &str,
+    model: &str,
+    patch_index: i64,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(patch_sha.unwrap_or("no-sha").as_bytes());
+    hasher.update(b"\0");
+    hasher.update(baseline_sha.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(patch_index.to_string().as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|b| format!("{:02x}", b))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
     use std::io::Write;
     use std::process::Command;
+
+    #[test]
+    fn checkpoint_scope_is_stable_for_identical_inputs() {
+        let a = checkpoint_scope(Some("abc123"), "base456", "claude-fable-5", 1);
+        let b = checkpoint_scope(Some("abc123"), "base456", "claude-fable-5", 1);
+        assert_eq!(a, b, "same review must resolve to the same scope");
+    }
+
+    #[test]
+    fn checkpoint_scope_changes_with_every_input() {
+        let base = checkpoint_scope(Some("abc123"), "base456", "claude-fable-5", 1);
+
+        for (label, other) in [
+            (
+                "patch sha",
+                checkpoint_scope(Some("def789"), "base456", "claude-fable-5", 1),
+            ),
+            (
+                "baseline",
+                checkpoint_scope(Some("abc123"), "base999", "claude-fable-5", 1),
+            ),
+            (
+                "model",
+                checkpoint_scope(Some("abc123"), "base456", "claude-opus-4-8", 1),
+            ),
+            (
+                "patch index",
+                checkpoint_scope(Some("abc123"), "base456", "claude-fable-5", 2),
+            ),
+            (
+                "missing sha",
+                checkpoint_scope(None, "base456", "claude-fable-5", 1),
+            ),
+        ] {
+            assert_ne!(
+                base, other,
+                "{} must not reuse another review's scope",
+                label
+            );
+        }
+    }
 
     fn git(repo_path: &Path, args: &[&str]) -> Result<()> {
         let output = Command::new("git")

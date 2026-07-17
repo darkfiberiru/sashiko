@@ -324,6 +324,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     stages: stages.clone(),
                     scratch_clone: false,
                     current_tree: false,
+                    // Unset: fall back to review.checkpoint_dir from settings.
+                    checkpoint_dir: None,
                 })
                 .await
                 .unwrap_or_else(|e| {

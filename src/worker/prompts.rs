@@ -95,6 +95,9 @@ pub struct WorkerConfig {
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
     pub stage_concurrency: usize,
+    /// Directory holding this review's stage checkpoints. `None` disables
+    /// checkpointing, in which case a retry re-runs every stage.
+    pub checkpoint_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +457,7 @@ pub struct Worker {
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
     stage_concurrency: usize,
+    checkpoint_dir: Option<PathBuf>,
 }
 
 impl Worker {
@@ -474,10 +478,29 @@ impl Worker {
             context_tag: None,
             stages: config.stages,
             stage_concurrency: config.stage_concurrency,
+            checkpoint_dir: config.checkpoint_dir,
         }
     }
 
+    /// Runs the full review protocol.
+    ///
+    /// Stage checkpoints are kept only while a review may still be retried:
+    /// once the protocol completes they cannot help a future run, so they are
+    /// dropped. A failure leaves them in place, which is what lets the next
+    /// attempt resume instead of re-running stages that already succeeded.
     pub async fn run(
+        &mut self,
+        patchset: Value,
+        progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+    ) -> Result<WorkerResult> {
+        let result = self.run_protocol(patchset, progress).await;
+        if result.is_ok() {
+            self.clear_checkpoints();
+        }
+        result
+    }
+
+    async fn run_protocol(
         &mut self,
         patchset: Value,
         progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
@@ -843,7 +866,7 @@ You MUST respond with ONLY a JSON object, no other text. Example:
                 clean_shared_context_no_log.clone()
             };
 
-            stage_futures.push(self.execute_stage(
+            stage_futures.push(self.execute_stage_checkpointed(
                 stage,
                 system_prompt,
                 clean_system_prompt,
@@ -1522,6 +1545,138 @@ Example Output:
         None
     }
 
+    /// Binds a stored stage result to the inputs that produced it. The rendered
+    /// system prompt already contains the patch, the log and the selected
+    /// subsystem prompts, so hashing it plus the stage number is sufficient to
+    /// detect any input change that would invalidate the result.
+    fn stage_fingerprint(stage_num: u8, system_prompt: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update([stage_num]);
+        hasher.update(system_prompt.as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{:02x}", b))
+            .collect()
+    }
+
+    fn checkpoint_path(&self, stage_num: u8) -> Option<PathBuf> {
+        self.checkpoint_dir
+            .as_ref()
+            .map(|dir| dir.join(format!("stage-{}.json", stage_num)))
+    }
+
+    /// Returns a previously completed result for this stage, or `None` when
+    /// there is no checkpoint, it is unreadable, or it was produced from
+    /// different inputs. A bad checkpoint is never fatal: the stage just runs.
+    fn load_stage_checkpoint(
+        &self,
+        stage_num: u8,
+        fingerprint: &str,
+    ) -> Option<StageExecutionResult> {
+        let path = self.checkpoint_path(stage_num)?;
+        let raw = std::fs::read_to_string(&path).ok()?;
+        let checkpoint: StageCheckpoint = match serde_json::from_str(&raw) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "Ignoring unreadable checkpoint {:?} for stage {}: {}",
+                    path, stage_num, e
+                );
+                return None;
+            }
+        };
+        if checkpoint.fingerprint != fingerprint {
+            info!(
+                "Ignoring stale checkpoint for stage {} (inputs changed since it was written)",
+                stage_num
+            );
+            return None;
+        }
+        Some(checkpoint.result)
+    }
+
+    /// Writes a completed stage result. Failures are logged and swallowed: a
+    /// checkpoint is an optimisation, never a reason to fail a good review.
+    fn save_stage_checkpoint(
+        &self,
+        stage_num: u8,
+        fingerprint: &str,
+        result: &StageExecutionResult,
+    ) {
+        let Some(path) = self.checkpoint_path(stage_num) else {
+            return;
+        };
+        let checkpoint = StageCheckpoint {
+            fingerprint: fingerprint.to_string(),
+            result: StageExecutionResult {
+                stage: result.stage,
+                concerns: result.concerns.clone(),
+                dismissed_concerns: result.dismissed_concerns.clone(),
+                tokens_in: result.tokens_in,
+                tokens_out: result.tokens_out,
+                tokens_cached: result.tokens_cached,
+                history: result.history.clone(),
+            },
+        };
+
+        if let Err(e) = Self::write_checkpoint_file(&path, &checkpoint) {
+            warn!("Failed to write checkpoint for stage {}: {}", stage_num, e);
+        }
+    }
+
+    /// Writes via a temporary file and renames, so an interrupted write cannot
+    /// leave a half-written checkpoint that a later run would try to use.
+    fn write_checkpoint_file(path: &Path, checkpoint: &StageCheckpoint) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string(checkpoint)?)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Drops this review's checkpoints once they can no longer be needed.
+    fn clear_checkpoints(&self) {
+        let Some(dir) = self.checkpoint_dir.as_ref() else {
+            return;
+        };
+        if dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(dir)
+        {
+            warn!("Failed to remove checkpoint directory {:?}: {}", dir, e);
+        }
+    }
+
+    /// Runs a stage, reusing a matching checkpoint when one exists and
+    /// recording the result for a future retry when one does not.
+    async fn execute_stage_checkpointed(
+        &self,
+        stage: Box<dyn ReviewStage>,
+        system_prompt: String,
+        clean_system_prompt: String,
+        progress: Option<&(dyn Fn(WorkerProgressEvent) + Send + Sync)>,
+    ) -> Result<StageExecutionResult> {
+        let stage_num = stage.number();
+        let fingerprint = Self::stage_fingerprint(stage_num, &system_prompt);
+
+        if let Some(result) = self.load_stage_checkpoint(stage_num, &fingerprint) {
+            info!("Stage {} resumed from checkpoint (not re-run)", stage_num);
+            if let Some(progress_cb) = progress {
+                progress_cb(WorkerProgressEvent::StageStarted { stage: stage_num });
+                progress_cb(WorkerProgressEvent::StageFinished { stage: stage_num });
+            }
+            return Ok(result);
+        }
+
+        let result = self
+            .execute_stage(stage, system_prompt, clean_system_prompt, progress)
+            .await?;
+        self.save_stage_checkpoint(stage_num, &fingerprint, &result);
+        Ok(result)
+    }
+
     async fn execute_stage(
         &self,
         stage: Box<dyn ReviewStage>,
@@ -1651,6 +1806,7 @@ Example:
     }
 }
 
+#[derive(Serialize, Deserialize)]
 struct StageExecutionResult {
     stage: u8,
     concerns: Vec<Value>,
@@ -1659,6 +1815,20 @@ struct StageExecutionResult {
     tokens_out: u32,
     tokens_cached: u32,
     history: Vec<AiMessage>,
+}
+
+/// On-disk checkpoint for one completed stage.
+///
+/// `fingerprint` binds the stored result to the exact inputs that produced it
+/// (stage number plus the fully rendered system prompt, which already covers the
+/// patch, the baseline log and the selected subsystem prompts). A checkpoint
+/// whose fingerprint does not match the current run is ignored rather than
+/// reused, so a changed patch, model or prompt bundle can never resurrect a
+/// stale result.
+#[derive(Serialize, Deserialize)]
+struct StageCheckpoint {
+    fingerprint: String,
+    result: StageExecutionResult,
 }
 
 pub fn calculate_series_range(
@@ -2135,6 +2305,7 @@ mod tests {
             custom_prompt: None,
             stages: None,
             stage_concurrency: 7,
+            checkpoint_dir: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2483,6 +2654,7 @@ mod tests {
             custom_prompt: None,
             stages: Some(vec![1]),
             stage_concurrency: 7,
+            checkpoint_dir: None,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 

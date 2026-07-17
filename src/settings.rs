@@ -343,6 +343,10 @@ fn default_stage_concurrency() -> usize {
     0
 }
 
+fn default_checkpoint_dir() -> String {
+    "review_checkpoints".to_string()
+}
+
 fn default_max_interactions() -> usize {
     100
 }
@@ -389,6 +393,12 @@ pub struct ReviewSettings {
     pub ignore_files: Vec<String>,
     #[serde(default = "default_email_policy_path")]
     pub email_policy_path: String,
+    /// Directory holding per-stage review checkpoints. A stage that completes is
+    /// written here, so a retried review resumes instead of re-running work that
+    /// already succeeded. Must not live under `worktree_dir`, which is wiped on
+    /// daemon startup. Set to an empty string to disable checkpointing.
+    #[serde(default = "default_checkpoint_dir")]
+    pub checkpoint_dir: String,
     /// Maximum cumulative non-cached tokens (uncached input + output) across all turns in a
     /// single review. Cached input tokens are excluded because they cost ~10x less and don't
     /// reflect runaway model behaviour. At Sonnet 4.6 pricing ($3/M uncached input, $15/M
@@ -478,6 +488,7 @@ fn default_forge() -> ForgeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalReviewReviewSettings {
     pub concurrency: Option<usize>,
+    pub checkpoint_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

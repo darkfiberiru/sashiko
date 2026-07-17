@@ -1556,6 +1556,11 @@ async fn run_review_tool(
         cmd.arg("--reuse-worktree").arg(path);
     }
 
+    if !settings.review.checkpoint_dir.trim().is_empty() {
+        cmd.arg("--checkpoint-dir")
+            .arg(&settings.review.checkpoint_dir);
+    }
+
     if let Some(stages) = &settings.review.stages {
         let stages_str = stages
             .iter()

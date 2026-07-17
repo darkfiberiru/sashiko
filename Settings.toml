@@ -138,6 +138,9 @@ repository_path = "third_party/linux"
 [review]
 concurrency = 16
 worktree_dir = "review_trees"
+# Per-stage checkpoints let a retried review resume instead of re-running
+# stages that already succeeded. Set to "" to disable.
+checkpoint_dir = "review_checkpoints"
 timeout_seconds = 7200
 max_retries = 3
 ignore_files = ["MAINTAINERS", ".mailmap", ".gitignore", "LICENSES/"]

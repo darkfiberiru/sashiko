@@ -38,6 +38,10 @@ struct Args {
     #[arg(long)]
     worktree_dir: Option<PathBuf>,
 
+    /// Root directory for per-stage checkpoints. Overrides review.checkpoint_dir.
+    #[arg(long)]
+    checkpoint_dir: Option<PathBuf>,
+
     #[arg(long)]
     prompts: Option<PathBuf>,
 
@@ -84,6 +88,7 @@ async fn main() -> Result<()> {
         baseline: args.baseline,
         repo: args.repo,
         worktree_dir: args.worktree_dir,
+        checkpoint_dir: args.checkpoint_dir,
         prompts: args
             .prompts
             .unwrap_or(prompt_bundle::default_kernel_prompts_path()?),

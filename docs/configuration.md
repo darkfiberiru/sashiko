@@ -161,6 +161,7 @@ Optional array of additional git remotes to track.
 |-----|------|---------|-------------|
 | `concurrency` | integer | -- | Number of concurrent reviews. |
 | `worktree_dir` | string | -- | Directory for git worktrees used during review. |
+| `checkpoint_dir` | string | `review_checkpoints` | Directory holding per-stage review checkpoints, so a retried review resumes instead of re-running stages that already succeeded. Must not be inside `worktree_dir`, which is wiped on daemon startup. Set to an empty string to disable. |
 | `timeout_seconds` | integer | `3600` | Maximum time per review (seconds). |
 | `max_retries` | integer | `3` | Retry count on transient failures. |
 | `max_lines_changed` | integer | `10000` | Skip patches with more changed lines than this. |
