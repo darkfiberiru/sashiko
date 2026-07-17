@@ -296,6 +296,11 @@ pub struct AiSettings {
     pub max_interactions: usize,
     #[serde(default = "default_temperature")]
     pub temperature: f32,
+    /// Maximum number of analysis stages (1-7) run in parallel within a
+    /// single patch review. Lower values reduce burst token usage and
+    /// rate-limit pressure at the cost of longer wall-clock time per review.
+    #[serde(default = "default_stage_concurrency")]
+    pub stage_concurrency: usize,
     #[serde(default = "default_api_timeout_secs")]
     pub api_timeout_secs: u64,
     #[serde(skip, default)]
@@ -332,6 +337,10 @@ fn default_api_timeout_secs() -> u64 {
 
 fn default_temperature() -> f32 {
     1.0
+}
+
+fn default_stage_concurrency() -> usize {
+    0
 }
 
 fn default_max_interactions() -> usize {

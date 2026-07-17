@@ -76,6 +76,7 @@ Core AI settings that apply to all providers.
 | `max_input_tokens` | integer | `150000` | Maximum input tokens per request. |
 | `max_interactions` | integer | `100` | Maximum tool-call rounds per review turn. |
 | `temperature` | float | `1.0` | Sampling temperature. |
+| `stage_concurrency` | integer | `0` | How many analysis stages (1-7) run in parallel within a single patch review. `0` means unbounded (all planned stages at once, the default), `1` runs them serially, and any `N` caps the fan-out at N. Lower non-zero values reduce burst token usage and rate-limit pressure at the cost of a slower review. |
 | `api_timeout_secs` | integer | `300` | Timeout for individual API calls (seconds). |
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. |

@@ -19,6 +19,7 @@ use crate::ai::{
 use crate::toolbox::ToolBox;
 use crate::worker::stage::{ReviewStage, create_stage};
 use anyhow::{Context, Result};
+use futures::stream::{StreamExt, TryStreamExt};
 
 /// Typed errors that must not be silently retried.
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +94,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub stages: Option<Vec<u8>>,
+    pub stage_concurrency: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -451,6 +453,7 @@ pub struct Worker {
     series_range: Option<String>,
     context_tag: Option<String>,
     stages: Option<Vec<u8>>,
+    stage_concurrency: usize,
 }
 
 impl Worker {
@@ -470,6 +473,7 @@ impl Worker {
             series_range: config.series_range,
             context_tag: None,
             stages: config.stages,
+            stage_concurrency: config.stage_concurrency,
         }
     }
 
@@ -847,14 +851,25 @@ You MUST respond with ONLY a JSON object, no other text. Example:
             ));
         }
 
-        // Run planned stages concurrently
+        // Run planned stages, bounded by stage_concurrency (0 = unbounded:
+        // every planned stage runs at once, reproducing the old try_join_all
+        // fan-out regardless of how many stages exist).
+        let concurrency = if self.stage_concurrency == 0 {
+            stage_futures.len().max(1)
+        } else {
+            self.stage_concurrency
+        };
         info!(
-            "Running {} planned stages concurrently",
-            stage_futures.len()
+            "Running {} planned stages ({} in parallel)",
+            stage_futures.len(),
+            concurrency
         );
-        let stage_results = futures::future::try_join_all(stage_futures).await?;
+        let stage_results: Vec<StageExecutionResult> = futures::stream::iter(stage_futures)
+            .buffered(concurrency)
+            .try_collect()
+            .await?;
 
-        // Consolidate results in deterministic order (already preserved by try_join_all)
+        // Consolidate results in deterministic order (preserved by buffered())
         for res in stage_results {
             total_tokens_in += res.tokens_in;
             total_tokens_out += res.tokens_out;
@@ -2119,6 +2134,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: None,
+            stage_concurrency: 7,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -2466,6 +2482,7 @@ mod tests {
             series_range: None,
             custom_prompt: None,
             stages: Some(vec![1]),
+            stage_concurrency: 7,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
