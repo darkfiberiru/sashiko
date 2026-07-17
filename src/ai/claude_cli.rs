@@ -25,6 +25,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Local, TimeZone};
 use serde_json::Value;
 use std::process::Stdio;
 use std::time::Duration;
@@ -62,9 +63,110 @@ impl ClassifyAiError for ClaudeCliError {
             ClaudeCliError::Wait(_) => AiErrorClass::Transient {
                 retry_after: Duration::from_secs(30),
             },
-            ClaudeCliError::Cli(_) => AiErrorClass::Fatal,
+            ClaudeCliError::Cli(msg) => classify_cli_message(msg, Local::now()),
             ClaudeCliError::Parse(_) => AiErrorClass::Fatal,
         }
+    }
+}
+
+/// Buffer added past a session-limit reset time before retrying, so we resume
+/// just after access returns rather than racing the reset to the second.
+const SESSION_RESET_BUFFER: Duration = Duration::from_secs(5 * 60);
+
+/// Fallback pause when a session limit is reported but its reset time cannot be
+/// parsed. Long enough to avoid hammering the CLI, short enough to recover if
+/// the guess is wrong.
+const SESSION_RESET_FALLBACK: Duration = Duration::from_secs(30 * 60);
+
+/// Classifies a `claude` CLI error message.
+///
+/// The CLI reports two recoverable conditions as plain text that would
+/// otherwise be treated as fatal:
+///   - a subscription session limit ("You've hit your session limit · resets
+///     9pm (America/New_York)"), which clears at a known wall-clock time;
+///   - a transient overload ("API Error: Overloaded", i.e. an HTTP 529).
+///
+/// Everything else remains fatal.
+///
+/// `now` is injected so the reset-time arithmetic is testable. The reset time
+/// is interpreted in the machine's local timezone; the CLI currently reports
+/// times in the local zone, so no zone conversion is done here (see
+/// DESIGN_TRANSIENT_ERROR_HANDLING.md).
+fn classify_cli_message(msg: &str, now: DateTime<Local>) -> AiErrorClass {
+    let lower = msg.to_lowercase();
+
+    if lower.contains("session limit") {
+        let retry_after = parse_session_reset(&lower, now)
+            .map(|d| d + SESSION_RESET_BUFFER)
+            .unwrap_or(SESSION_RESET_FALLBACK);
+        return AiErrorClass::SessionLimit { retry_after };
+    }
+
+    if lower.contains("overloaded") || lower.contains("529") {
+        return AiErrorClass::Transient {
+            retry_after: Duration::from_secs(30),
+        };
+    }
+
+    AiErrorClass::Fatal
+}
+
+/// Extracts the duration until the next "resets <time>" wall-clock instant.
+///
+/// Handles `9pm`, `10:30am`, `12am` (midnight) and `12pm` (noon). Returns the
+/// gap from `now` to the next occurrence of that local time strictly in the
+/// future; `None` if no reset time is present or it cannot be parsed.
+fn parse_session_reset(lower_msg: &str, now: DateTime<Local>) -> Option<Duration> {
+    let re = regex::Regex::new(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)").ok()?;
+    let caps = re.captures(lower_msg)?;
+
+    let hour12: u32 = caps.get(1)?.as_str().parse().ok()?;
+    if !(1..=12).contains(&hour12) {
+        return None;
+    }
+    let minute: u32 = match caps.get(2) {
+        Some(m) => m.as_str().parse().ok()?,
+        None => 0,
+    };
+    if minute > 59 {
+        return None;
+    }
+    let is_pm = caps.get(3)?.as_str() == "pm";
+
+    // 12am -> 0, 12pm -> 12, otherwise add 12 for pm.
+    let hour24 = match (hour12, is_pm) {
+        (12, false) => 0,
+        (12, true) => 12,
+        (h, false) => h,
+        (h, true) => h + 12,
+    };
+
+    let today = now.date_naive().and_hms_opt(hour24, minute, 0)?;
+    let target = match resolve_local(today) {
+        Some(dt) if dt > now => dt,
+        // Already passed today (or skipped by a DST gap today): use tomorrow.
+        _ => {
+            let tomorrow = now
+                .date_naive()
+                .succ_opt()?
+                .and_hms_opt(hour24, minute, 0)?;
+            resolve_local(tomorrow)?
+        }
+    };
+
+    (target - now).to_std().ok()
+}
+
+/// Resolves a naive local datetime to a concrete instant, choosing the earliest
+/// valid one if the wall-clock time is ambiguous (fall-back DST hour). Returns
+/// `None` if the time does not exist (spring-forward gap); the caller then uses
+/// a safe fallback pause.
+fn resolve_local(naive: chrono::NaiveDateTime) -> Option<DateTime<Local>> {
+    use chrono::offset::LocalResult;
+    match Local.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Some(dt),
+        LocalResult::Ambiguous(earliest, _) => Some(earliest),
+        LocalResult::None => None,
     }
 }
 
@@ -441,7 +543,92 @@ fn extract_json(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::ai::{AiMessage, AiRequest, AiResponseFormat, AiRole, AiTool};
+    use chrono::TimeZone;
     use serde_json::json;
+
+    fn at(hour: u32, min: u32) -> DateTime<Local> {
+        // A fixed reference day well clear of any DST boundary.
+        Local
+            .with_ymd_and_hms(2026, 6, 15, hour, min, 0)
+            .single()
+            .expect("valid local time")
+    }
+
+    #[test]
+    fn overloaded_is_transient() {
+        let c = classify_cli_message("API Error: Overloaded", at(15, 0));
+        assert!(matches!(c, AiErrorClass::Transient { .. }));
+    }
+
+    #[test]
+    fn http_529_is_transient() {
+        let c = classify_cli_message("claude CLI error: 529 overloaded_error", at(15, 0));
+        assert!(matches!(c, AiErrorClass::Transient { .. }));
+    }
+
+    #[test]
+    fn unknown_cli_error_stays_fatal() {
+        let c = classify_cli_message("some unrecognized failure", at(15, 0));
+        assert!(matches!(c, AiErrorClass::Fatal));
+    }
+
+    #[test]
+    fn session_limit_waits_until_reset_plus_buffer() {
+        // At 3pm, "resets 9pm" -> 6h until reset, + 5 min buffer.
+        let msg = "You've hit your session limit · resets 9pm (America/New_York)";
+        let c = classify_cli_message(msg, at(15, 0));
+        match c {
+            AiErrorClass::SessionLimit { retry_after } => {
+                let secs = retry_after.as_secs();
+                assert_eq!(secs, 6 * 3600 + 5 * 60, "6h to 9pm plus 5 min buffer");
+            }
+            other => panic!("expected SessionLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_reset_rolls_to_tomorrow_when_past() {
+        // At 10pm, "resets 9pm" already passed today -> next 9pm is tomorrow.
+        let d = parse_session_reset("resets 9pm", at(22, 0)).expect("parsed");
+        assert_eq!(d.as_secs(), 23 * 3600, "23h until tomorrow 9pm");
+    }
+
+    #[test]
+    fn session_reset_handles_minutes_and_noon_midnight() {
+        // 10:30am from 9am -> 1h30m.
+        assert_eq!(
+            parse_session_reset("resets 10:30am", at(9, 0))
+                .unwrap()
+                .as_secs(),
+            90 * 60
+        );
+        // 12pm (noon) from 9am -> 3h.
+        assert_eq!(
+            parse_session_reset("resets 12pm", at(9, 0))
+                .unwrap()
+                .as_secs(),
+            3 * 3600
+        );
+        // 12am (midnight) from 9pm -> 3h to next midnight.
+        assert_eq!(
+            parse_session_reset("resets 12am", at(21, 0))
+                .unwrap()
+                .as_secs(),
+            3 * 3600
+        );
+    }
+
+    #[test]
+    fn session_limit_unparseable_time_uses_fallback() {
+        // "session limit" present but no parseable reset -> fallback pause.
+        let c = classify_cli_message("You've hit your session limit", at(15, 0));
+        match c {
+            AiErrorClass::SessionLimit { retry_after } => {
+                assert_eq!(retry_after, SESSION_RESET_FALLBACK);
+            }
+            other => panic!("expected SessionLimit fallback, got {:?}", other),
+        }
+    }
 
     fn make_request(messages: Vec<AiMessage>) -> AiRequest {
         AiRequest {

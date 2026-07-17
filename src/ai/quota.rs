@@ -18,6 +18,12 @@ use tracing::{info, warn};
 
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
+/// Upper bound for an authoritative scheduled block (e.g. a subscription
+/// session limit with a known reset time). Longer than [`MAX_RETRY_AFTER`]
+/// because the wait is not a guess, but still bounded so a misparsed reset
+/// time cannot block indefinitely.
+const MAX_SCHEDULED_BLOCK: Duration = Duration::from_secs(12 * 60 * 60);
+
 pub struct QuotaManager {
     // Stores the time when we can resume making requests.
     // If None or in the past, we are free to go.
@@ -89,6 +95,28 @@ impl QuotaManager {
         warn!(
             "Quota exhausted! Blocking all LLM requests for {:.2}s",
             retry_after.as_secs_f64()
+        );
+    }
+
+    /// Blocks all LLM requests until an authoritative resume time.
+    ///
+    /// Used for subscription session limits, where the provider gives an exact
+    /// reset time rather than a short backoff. The wait is honoured up to
+    /// [`MAX_SCHEDULED_BLOCK`] instead of the much shorter [`MAX_RETRY_AFTER`],
+    /// so the review pauses once and resumes just after the reset rather than
+    /// polling a doomed request every few minutes.
+    pub async fn report_scheduled_block(&self, retry_after: Duration) {
+        let retry_after = retry_after.min(MAX_SCHEDULED_BLOCK);
+        let mut guard = self.blocked_until.lock().await;
+        let resume_time = Instant::now() + retry_after;
+
+        if guard.map(|current| resume_time > current).unwrap_or(true) {
+            *guard = Some(resume_time);
+        }
+
+        warn!(
+            "Session limit reached. Pausing all LLM requests for {:.0} min (until reset).",
+            retry_after.as_secs_f64() / 60.0
         );
     }
 }

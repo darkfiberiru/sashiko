@@ -49,6 +49,13 @@ pub async fn handle_generate(
                         state.quota_manager.report_quota_error(retry_after).await;
                         continue;
                     }
+                    AiErrorClass::SessionLimit { retry_after } => {
+                        state
+                            .quota_manager
+                            .report_scheduled_block(retry_after)
+                            .await;
+                        continue;
+                    }
                     AiErrorClass::Transient { retry_after } => {
                         local_transient_errors += 1;
                         let backoff_secs =

@@ -239,6 +239,17 @@ impl<'a> SessionRunner<'a> {
             let resp = match self.provider.generate_content(request).await {
                 Ok(r) => r,
                 Err(e) => match classify_ai_error(&e) {
+                    AiErrorClass::SessionLimit { retry_after } => {
+                        // Authoritative reset wait: pause without spending the
+                        // transient-retry budget, since it is not a flaky error.
+                        tracing::warn!(
+                            "Session limit hit, pausing {:.0} min until reset...",
+                            retry_after.as_secs_f64() / 60.0
+                        );
+                        tokio::time::sleep(retry_after).await;
+                        turns = turns.saturating_sub(1);
+                        continue;
+                    }
                     AiErrorClass::RateLimit { retry_after }
                     | AiErrorClass::Transient { retry_after } => {
                         transient_retries += 1;

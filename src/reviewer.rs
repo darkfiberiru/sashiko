@@ -1787,6 +1787,16 @@ async fn run_review_tool(
                                                                         .await;
                                                                     continue;
                                                                 }
+                                                                AiErrorClass::SessionLimit { retry_after } => {
+                                                                    tracing::warn!(
+                                                                        "Session limit hit. Pausing review for {:.0} min until reset (then resuming).",
+                                                                        retry_after.as_secs_f64() / 60.0
+                                                                    );
+                                                                    quota_clone
+                                                                        .report_scheduled_block(retry_after)
+                                                                        .await;
+                                                                    continue;
+                                                                }
                                                                 AiErrorClass::Transient { retry_after } => {
                                                                     local_transient_errors += 1;
                                                                     let backoff_secs = (1.0 * (2.0_f64.powi(local_transient_errors - 1))).min(60.0);

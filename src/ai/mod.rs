@@ -194,6 +194,14 @@ pub enum AiErrorClass {
         #[serde(rename = "retry_after_secs", with = "duration_secs")]
         retry_after: Duration,
     },
+    /// The account hit a subscription session limit that resets at a known
+    /// time. Unlike `RateLimit`, the wait is authoritative: the provider told
+    /// us exactly when access returns, so it is honoured in full rather than
+    /// capped to a short backoff.
+    SessionLimit {
+        #[serde(rename = "retry_after_secs", with = "duration_secs")]
+        retry_after: Duration,
+    },
 }
 
 mod duration_secs {
