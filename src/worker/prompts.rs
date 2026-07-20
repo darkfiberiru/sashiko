@@ -877,22 +877,20 @@ You MUST respond with ONLY a JSON object, no other text. Example:
         // Run planned stages, bounded by stage_concurrency (0 = unbounded:
         // every planned stage runs at once, reproducing the old try_join_all
         // fan-out regardless of how many stages exist).
-        let concurrency = if self.stage_concurrency == 0 {
-            stage_futures.len().max(1)
+        let parallel = if self.stage_concurrency == 0 {
+            "unbounded".to_string()
         } else {
-            self.stage_concurrency
+            format!("{} in parallel", self.stage_concurrency)
         };
         info!(
-            "Running {} planned stages ({} in parallel)",
+            "Running {} planned stages ({})",
             stage_futures.len(),
-            concurrency
+            parallel
         );
-        let stage_results: Vec<StageExecutionResult> = futures::stream::iter(stage_futures)
-            .buffered(concurrency)
-            .try_collect()
-            .await?;
+        let stage_results: Vec<StageExecutionResult> =
+            run_bounded(stage_futures, self.stage_concurrency).await?;
 
-        // Consolidate results in deterministic order (preserved by buffered())
+        // Consolidate results in deterministic order (preserved by run_bounded())
         for res in stage_results {
             total_tokens_in += res.tokens_in;
             total_tokens_out += res.tokens_out;
@@ -1831,6 +1829,29 @@ struct StageCheckpoint {
     result: StageExecutionResult,
 }
 
+/// Runs `tasks` with at most `concurrency` in flight at once, collecting their
+/// results in **submission order** (not completion order). A `concurrency` of 0
+/// means unbounded: every task runs at once. The first error short-circuits and
+/// is returned.
+///
+/// This is the stage fan-out primitive for a review: `ai.stage_concurrency`
+/// bounds how many analysis stages call the model simultaneously, while callers
+/// can still consolidate findings deterministically because order is preserved.
+async fn run_bounded<F, T>(tasks: Vec<F>, concurrency: usize) -> Result<Vec<T>>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let in_flight = if concurrency == 0 {
+        tasks.len().max(1)
+    } else {
+        concurrency
+    };
+    futures::stream::iter(tasks)
+        .buffered(in_flight)
+        .try_collect()
+        .await
+}
+
 pub fn calculate_series_range(
     patches: &[PatchInput],
     patches_to_review: &[PatchInput],
@@ -2090,6 +2111,97 @@ impl LlmSession for ReviewStageSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A task that records the peak number of concurrently in-flight tasks and
+    /// returns its own index. All increments happen synchronously before the
+    /// first await, so the observed peak is deterministic regardless of timing.
+    /// Later tasks are made to finish first, so completion order differs from
+    /// submission order — which is exactly what the ordering assertion checks.
+    async fn concurrency_probe(
+        idx: usize,
+        total: usize,
+        inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        peak: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Result<usize> {
+        let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        peak.fetch_max(now, Ordering::SeqCst);
+        // Earlier tasks sleep longer, so they complete last.
+        let ms = (total - idx) as u64 * 5;
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        inflight.fetch_sub(1, Ordering::SeqCst);
+        Ok(idx)
+    }
+
+    #[tokio::test]
+    async fn run_bounded_preserves_order_and_caps_concurrency() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        const N: usize = 7;
+        for concurrency in [1usize, 2, 3, 7, 99] {
+            let inflight = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let tasks: Vec<_> = (0..N)
+                .map(|i| concurrency_probe(i, N, inflight.clone(), peak.clone()))
+                .collect();
+
+            let results = run_bounded(tasks, concurrency).await.unwrap();
+
+            // Results come back in submission order, not completion order.
+            assert_eq!(
+                results,
+                (0..N).collect::<Vec<_>>(),
+                "order must be preserved for concurrency={concurrency}"
+            );
+            // Never more than `concurrency` tasks (or N, whichever is smaller)
+            // were in flight at once.
+            assert_eq!(
+                peak.load(Ordering::SeqCst),
+                concurrency.min(N),
+                "peak in-flight for concurrency={concurrency}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn run_bounded_zero_means_unbounded() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+
+        // A concurrency of 0 runs every task at once (unbounded fan-out).
+        const N: usize = 4;
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let tasks: Vec<_> = (0..N)
+            .map(|i| concurrency_probe(i, N, inflight.clone(), peak.clone()))
+            .collect();
+
+        let results = run_bounded(tasks, 0).await.unwrap();
+
+        assert_eq!(results, (0..N).collect::<Vec<_>>());
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            N,
+            "zero runs all tasks at once"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_bounded_short_circuits_on_error() {
+        async fn ok(i: usize) -> Result<usize> {
+            Ok(i)
+        }
+        async fn boom(_: usize) -> Result<usize> {
+            anyhow::bail!("stage failed")
+        }
+
+        // Heterogeneous futures need boxing to share one Vec type.
+        let tasks: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>>>>> =
+            vec![Box::pin(ok(0)), Box::pin(boom(1)), Box::pin(ok(2))];
+
+        let result = run_bounded(tasks, 3).await;
+        assert!(result.is_err(), "an erroring task must fail the batch");
+    }
 
     #[test]
     fn test_append_stage_dismissed_concerns_preserves_category_type() {
