@@ -78,6 +78,11 @@ const SESSION_RESET_BUFFER: Duration = Duration::from_secs(5 * 60);
 /// the guess is wrong.
 const SESSION_RESET_FALLBACK: Duration = Duration::from_secs(30 * 60);
 
+/// Grace window past a reported reset within which a repeated session-limit
+/// message is treated as a *late* reset (retry soon) rather than the next day's
+/// cycle. See [`parse_session_reset`] for the rationale.
+const SESSION_RESET_GRACE_MINUTES: i64 = 30;
+
 /// Classifies a `claude` CLI error message.
 ///
 /// The CLI reports two recoverable conditions as plain text that would
@@ -111,11 +116,19 @@ fn classify_cli_message(msg: &str, now: DateTime<Local>) -> AiErrorClass {
     AiErrorClass::Fatal
 }
 
-/// Extracts the duration until the next "resets <time>" wall-clock instant.
+/// Extracts the duration until we should next retry after a "resets <time>"
+/// message.
 ///
-/// Handles `9pm`, `10:30am`, `12am` (midnight) and `12pm` (noon). Returns the
-/// gap from `now` to the next occurrence of that local time strictly in the
-/// future; `None` if no reset time is present or it cannot be parsed.
+/// Handles `9pm`, `10:30am`, `12am` (midnight) and `12pm` (noon). Behaviour by
+/// where the reset time falls relative to `now`:
+///   - still ahead today  -> wait until it (the exact reset);
+///   - just passed (within [`SESSION_RESET_GRACE_MINUTES`]) -> `ZERO`, so the
+///     caller's buffer yields a ~5-minute poll. This is the "hit the timer,
+///     still limited" case: the reset is late, so retry soon rather than waiting
+///     a whole day;
+///   - well in the past    -> the same time tomorrow (the next cycle).
+///
+/// Returns `None` if no reset time is present or it cannot be parsed.
 fn parse_session_reset(lower_msg: &str, now: DateTime<Local>) -> Option<Duration> {
     let re = regex::Regex::new(r"resets\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)").ok()?;
     let caps = re.captures(lower_msg)?;
@@ -142,19 +155,20 @@ fn parse_session_reset(lower_msg: &str, now: DateTime<Local>) -> Option<Duration
     };
 
     let today = now.date_naive().and_hms_opt(hour24, minute, 0)?;
-    let target = match resolve_local(today) {
-        Some(dt) if dt > now => dt,
-        // Already passed today (or skipped by a DST gap today): use tomorrow.
+    match resolve_local(today) {
+        // Still ahead today: wait until it.
+        Some(dt) if dt > now => (dt - now).to_std().ok(),
+        // Only just passed: the reset is running late, so retry soon.
+        Some(dt) if (now - dt).num_minutes() <= SESSION_RESET_GRACE_MINUTES => Some(Duration::ZERO),
+        // Well in the past (or a DST gap today): next day's cycle.
         _ => {
             let tomorrow = now
                 .date_naive()
                 .succ_opt()?
                 .and_hms_opt(hour24, minute, 0)?;
-            resolve_local(tomorrow)?
+            (resolve_local(tomorrow)? - now).to_std().ok()
         }
-    };
-
-    (target - now).to_std().ok()
+    }
 }
 
 /// Resolves a naive local datetime to a concrete instant, choosing the earliest
@@ -588,9 +602,39 @@ mod tests {
 
     #[test]
     fn session_reset_rolls_to_tomorrow_when_past() {
-        // At 10pm, "resets 9pm" already passed today -> next 9pm is tomorrow.
+        // 10pm vs "resets 9pm": an hour past, beyond the grace window.
         let d = parse_session_reset("resets 9pm", at(22, 0)).expect("parsed");
         assert_eq!(d.as_secs(), 23 * 3600, "23h until tomorrow 9pm");
+    }
+
+    #[test]
+    fn session_reset_just_passed_retries_soon() {
+        // Reset only just passed -> ZERO; the caller's buffer makes it a poll.
+        assert_eq!(
+            parse_session_reset("resets 9pm", at(21, 5)),
+            Some(Duration::ZERO),
+            "5 min past reset should retry soon, not tomorrow"
+        );
+        // End to end: the classified pause is exactly the 5-minute buffer.
+        match classify_cli_message("session limit · resets 9pm", at(21, 5)) {
+            AiErrorClass::SessionLimit { retry_after } => {
+                assert_eq!(retry_after, SESSION_RESET_BUFFER, "delayed reset -> 5 min");
+            }
+            other => panic!("expected SessionLimit, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn session_reset_grace_boundary() {
+        // At exactly the grace edge (30 min past) it still counts as just-passed.
+        assert_eq!(
+            parse_session_reset("resets 9pm", at(21, 30)),
+            Some(Duration::ZERO),
+            "30 min past is within the grace window"
+        );
+        // Well beyond the grace window rolls to the next day.
+        let d = parse_session_reset("resets 9pm", at(23, 0)).expect("parsed");
+        assert_eq!(d.as_secs(), 22 * 3600, "2h past -> tomorrow 9pm (22h away)");
     }
 
     #[test]

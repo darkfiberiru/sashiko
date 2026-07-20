@@ -76,11 +76,28 @@ as `"class": "session_limit"` with no ambiguity.
 is unit-testable.
 
 `parse_session_reset` extracts `resets <time>` (`9pm`, `10:30am`, `12am`,
-`12pm`), computes the next occurrence of that local time strictly after `now`,
-and returns the gap. `classify_cli_message` adds a 5-minute buffer so the retry
-lands just after the reset instead of racing it. If the time cannot be parsed,
-it falls back to a 30-minute pause — long enough not to hammer the CLI, short
-enough to recover.
+`12pm`) and returns how long to wait, keyed on where that local time falls
+relative to `now`:
+
+- **still ahead today** → the gap until it. `classify_cli_message` adds a
+  5-minute buffer so the retry lands just after the reset instead of racing it.
+- **just passed (within a 30-minute grace)** → a ~5-minute poll. This is the
+  "hit the timer, still limited" case: we waited for the reported reset, retried,
+  and got the *same* reset time back, which means the reset is running late. A
+  short poll recovers within minutes. Without this, an already-passed time would
+  be read as *tomorrow's* reset — a reset delayed by 5 minutes would otherwise
+  put the review to sleep for ~12 hours (the `report_scheduled_block` ceiling).
+- **well in the past (beyond the grace)** → the same time tomorrow, the next
+  cycle. Being limited more than half an hour past the reported reset time is a
+  fresh limit for the next window, not a delayed one.
+
+If the time cannot be parsed, it falls back to a 30-minute pause — long enough
+not to hammer the CLI, short enough to recover.
+
+The 30-minute grace is a heuristic, not a proof: a reset delayed by *more* than
+30 minutes falls into the tomorrow branch and over-waits (bounded by the 12-hour
+ceiling and checkpoint-resume). The fully robust alternative — tracking "did we
+just wait for this exact reset?" in the retry loop — is noted in Future work.
 
 DST is handled: an ambiguous fall-back hour resolves to the earliest instant, a
 skipped spring-forward hour returns `None` and takes the 30-minute fallback.
